@@ -1,0 +1,27 @@
+# Redroid Docker Compose Configuration
+# Ubuntu VM 내부에서 사용
+#
+# 사용법:
+#   docker compose up -d
+#   docker compose logs -f redroid
+#   docker compose down
+
+services:
+  redroid:
+    image: redroid/redroid:14.0.0_64only-latest
+    container_name: redroid
+    privileged: true
+    ports:
+      - "5555:5555"   # ADB
+      - "3000:3000"   # Iris dashboard
+    volumes:
+      - redroid-data:/data
+    command:
+      - ro.product.model=SM-T970
+      - ro.product.brand=Samsung
+      - androidboot.redroid_gpu_mode=guest
+    restart: unless-stopped
+
+volumes:
+  redroid-data:
+    driver: local

@@ -1,0 +1,13 @@
+[Unit]
+Description=Load binder and ashmem kernel modules for Redroid
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/modprobe binder_linux devices="binder,hwbinder,vndbinder"
+ExecStart=/sbin/modprobe ashmem_linux
+
+[Install]
+WantedBy=multi-user.target
