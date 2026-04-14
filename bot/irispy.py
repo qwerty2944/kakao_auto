@@ -39,6 +39,12 @@ MAX_CONTEXT_TURNS = 10  # 방당 최대 저장 턴 수 (user+model 쌍)
 room_contexts: dict[str, list[dict]] = {}
 room_ctx_lock = threading.Lock()
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+EMBEDDING_MODEL = "gemini-embedding-001"
+recording_rooms: set[str] = set()
+recording_rooms_lock = threading.Lock()
+
 
 def load_contacts() -> dict:
     """저장된 연락처 로드"""
@@ -58,6 +64,135 @@ def save_contact(user_id: str, name: str, room: str):
             json.dump(contacts, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def supabase_request(method: str, path: str, data: dict | list | None = None, prefer: str = "") -> dict | list | None:
+    """Supabase REST API 래퍼"""
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    body = json.dumps(data).encode("utf-8") if data is not None else None
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read().decode("utf-8")
+        if not raw:
+            return None
+        return json.loads(raw)
+
+
+def supabase_rpc(func_name: str, params: dict) -> list | dict | None:
+    """Supabase RPC 함수 호출"""
+    url = f"{SUPABASE_URL}/rest/v1/rpc/{func_name}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = json.dumps(params).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read().decode("utf-8")
+        if not raw:
+            return None
+        return json.loads(raw)
+
+
+def get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float] | None:
+    """Gemini embedding API로 768차원 임베딩 벡터 반환"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBEDDING_MODEL}:embedContent?key={GEMINI_API_KEY}"
+    payload = json.dumps({
+        "model": f"models/{EMBEDDING_MODEL}",
+        "content": {"parts": [{"text": text}]},
+        "taskType": task_type,
+        "outputDimensionality": 768,
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("embedding", {}).get("values")
+    except Exception as e:
+        print(f"[임베딩] 오류: {e}", flush=True)
+        return None
+
+
+def store_message_embedding(room_id: str, room_name: str, sender_name: str, sender_id: str, message_text: str):
+    """메시지 임베딩 생성 후 Supabase에 저장 (백그라운드 스레드에서 호출)"""
+    try:
+        embedding = get_embedding(message_text, "RETRIEVAL_DOCUMENT")
+        row = {
+            "room_id": room_id or "",
+            "room_name": room_name or "",
+            "sender_name": sender_name or str(sender_id) or "unknown",
+            "sender_id": sender_id or "",
+            "message_text": message_text or "",
+        }
+        if embedding:
+            row["embedding"] = "[" + ",".join(str(v) for v in embedding) + "]"
+        supabase_request("POST", "message_embeddings", row, prefer="return=minimal")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"[기록] 저장 실패: {e} | {body}", flush=True)
+    except Exception as e:
+        print(f"[기록] 저장 실패: {e}", flush=True)
+
+
+def load_recording_rooms():
+    """시작 시 기록 중인 방 목록을 DB에서 로드"""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("[기록] SUPABASE_URL 또는 SUPABASE_KEY 미설정, 기록 기능 비활성화", flush=True)
+        return
+    try:
+        rows = supabase_request("GET", "recorded_rooms?select=room_id")
+        if rows:
+            with recording_rooms_lock:
+                for row in rows:
+                    recording_rooms.add(row["room_id"])
+            print(f"[기록] {len(recording_rooms)}개 방 기록 중", flush=True)
+    except Exception as e:
+        print(f"[기록] 방 목록 로드 실패: {e}", flush=True)
+
+
+def search_messages(room_id: str, query: str) -> str:
+    """RAG: 임베딩→벡터검색→Gemini 답변생성"""
+    query_emb = get_embedding(query, "RETRIEVAL_QUERY")
+    if not query_emb:
+        return "검색용 임베딩 생성에 실패했습니다."
+    try:
+        emb_str = "[" + ",".join(str(v) for v in query_emb) + "]"
+        results = supabase_request(
+            "POST", "rpc/match_messages",
+            {
+                "query_embedding": emb_str,
+                "target_room_id": room_id,
+                "match_threshold": 0.3,
+                "match_count": 20,
+            },
+        )
+    except Exception as e:
+        return f"검색 오류: {e}"
+    if not results:
+        return "관련 대화를 찾지 못했습니다."
+    # 컨텍스트 구성
+    context_lines = []
+    for r in results:
+        sent_at = r.get("sent_at", "")[:19].replace("T", " ")
+        context_lines.append(f"[{sent_at}] {r['sender_name']}: {r['message_text']}")
+    context = "\n".join(context_lines)
+    # Gemini로 답변 생성
+    prompt = (
+        f"다음은 카카오톡 대화 기록에서 검색된 메시지들입니다:\n\n"
+        f"{context}\n\n"
+        f"위 대화 내용을 바탕으로 다음 질문에 답해주세요:\n{query}\n\n"
+        f"대화 내용에 없는 정보는 추측하지 말고, 찾은 내용만 근거로 답해주세요."
+    )
+    answer, _ = ask_gemini(prompt)
+    return answer
 
 
 def iris_query(sql: str) -> list[dict]:
@@ -180,7 +315,9 @@ def _handle_message(chat: ChatContext):
     command = chat.message.command
     param = chat.message.param
 
-    print(f"[{chat.room.name}] {chat.sender.name}: {text}", flush=True)
+    room_name = chat.room.name or str(chat.room.id)
+    sender_name = chat.sender.name or str(chat.sender.id)
+    print(f"[{room_name}] {sender_name}: {text}", flush=True)
 
     # 메시지 보낸 사람 자동 수집 (본인 제외)
     sender_id = str(getattr(chat.sender, "id", "") or "")
@@ -203,8 +340,7 @@ def _handle_message(chat: ChatContext):
     elif command == "/질문":
         if chat.message.has_param:
             chat.reply("생각 중...")
-            room_key = str(chat.room.id)
-            answer, token_info = ask_gemini(param, room_key)
+            answer, token_info = ask_gemini(param)
             chat.reply(answer + token_info)
         else:
             chat.reply("사용법: /질문 <질문 내용>")
@@ -240,6 +376,47 @@ def _handle_message(chat: ChatContext):
         else:
             chat.reply("사용법: /그림 <설명>\n예: /그림 귀여운 바나나 캐릭터")
 
+    elif command == "/기록시작":
+        room_key = str(chat.room.id)
+        with recording_rooms_lock:
+            if room_key in recording_rooms:
+                chat.reply("이미 이 방의 대화를 기록 중입니다.")
+                return
+        try:
+            supabase_request("POST", "recorded_rooms", {
+                "room_id": room_key,
+                "room_name": chat.room.name or str(chat.room.id),
+                "started_by": chat.sender.name or str(chat.sender.id),
+            }, prefer="return=minimal")
+            with recording_rooms_lock:
+                recording_rooms.add(room_key)
+            chat.reply(f"이 방의 대화 기록을 시작합니다.\n방 이름: {chat.room.name or room_key}")
+        except Exception as e:
+            chat.reply(f"기록 시작 실패: {e}")
+
+    elif command == "/기록중지":
+        room_key = str(chat.room.id)
+        with recording_rooms_lock:
+            if room_key not in recording_rooms:
+                chat.reply("이 방은 기록 중이 아닙니다.")
+                return
+        try:
+            supabase_request("DELETE", f"recorded_rooms?room_id=eq.{room_key}")
+            with recording_rooms_lock:
+                recording_rooms.discard(room_key)
+            chat.reply("대화 기록을 중지했습니다.\n(기존 기록은 유지됩니다)")
+        except Exception as e:
+            chat.reply(f"기록 중지 실패: {e}")
+
+    elif command == "/검색":
+        if chat.message.has_param:
+            room_key = str(chat.room.id)
+            chat.reply("검색 중...")
+            answer = search_messages(room_key, param)
+            chat.reply(answer)
+        else:
+            chat.reply("사용법: /검색 <질문>\n예: /검색 지난주 회의에서 결정된 사항이 뭐야?")
+
     elif command == "/친구목록":
         contacts = load_contacts()
         if not contacts:
@@ -261,9 +438,24 @@ def _handle_message(chat: ChatContext):
             "/초기화 - AI 대화 기록 초기화\n"
             "/그림 <설명> - AI 이미지 생성\n"
             "/친구목록 - 대화한 친구 목록 (자동 수집)\n"
+            "/기록시작 - 이 방의 대화 기록 시작\n"
+            "/기록중지 - 대화 기록 중지\n"
+            "/검색 <질문> - 기록된 대화에서 RAG 검색\n"
             "/help - 이 도움말"
         )
         chat.reply(help_text)
+
+    # 기록 중인 방의 일반 메시지 저장 (명령어가 아닌 경우)
+    if not text.startswith("/"):
+        room_key = str(chat.room.id)
+        with recording_rooms_lock:
+            is_recording = room_key in recording_rooms
+        if is_recording:
+            threading.Thread(
+                target=store_message_embedding,
+                args=(room_key, room_name, sender_name, sender_id, text),
+                daemon=True,
+            ).start()
 
 
 def _db_poll_loop():
@@ -285,8 +477,8 @@ def _db_poll_loop():
             rows = iris_query(
                 f"SELECT id, user_id, message, v, chat_id, supplement "
                 f"FROM chat_logs "
-                f"WHERE id > {last_id} AND supplement = '' "
-                f"ORDER BY id ASC LIMIT 10"
+                f"WHERE id > {last_id} "
+                f"ORDER BY id ASC LIMIT 20"
             )
             for row in rows:
                 msg_id = int(row["id"])
@@ -297,7 +489,8 @@ def _db_poll_loop():
                     continue
                 msg_text = row.get("message", "")
                 chat_id = int(row["chat_id"])
-                if msg_text.startswith("/"):
+                supplement = row.get("supplement", "")
+                if msg_text.startswith("/") and supplement == "":
                     parts = msg_text.split(" ", 1)
                     cmd = parts[0]
                     param = parts[1] if len(parts) > 1 else ""
@@ -306,6 +499,17 @@ def _db_poll_loop():
                     threading.Thread(
                         target=_handle_polled_command, args=(cmd, param, chat_id), daemon=True
                     ).start()
+                elif not msg_text.startswith("/") and msg_text.strip():
+                    # 기록 중인 방의 일반 메시지 저장
+                    room_key = str(chat_id)
+                    with recording_rooms_lock:
+                        is_recording = room_key in recording_rooms
+                    if is_recording:
+                        threading.Thread(
+                            target=store_message_embedding,
+                            args=(room_key, "", str(user_id), str(user_id), msg_text),
+                            daemon=True,
+                        ).start()
             if not rows:
                 # supplement='' 메시지가 없을 때만 last_id를 최신으로 갱신
                 # (처리 중 도착한 supplement='' 메시지 스킵 방지)
@@ -339,8 +543,7 @@ def _handle_polled_command(cmd: str, param: str, room_id: int):
         _iris_reply(room_id, f"현재 시간: {now}")
     elif cmd == "/질문" and param:
         _iris_reply(room_id, "생각 중...")
-        room_key = str(room_id)
-        answer, token_info = ask_gemini(param, room_key)
+        answer, token_info = ask_gemini(param)
         _iris_reply(room_id, answer + token_info)
     elif cmd == "/초기화":
         with room_ctx_lock:
@@ -362,12 +565,47 @@ def _handle_polled_command(cmd: str, param: str, room_id: int):
             bot.api.reply_media(room_id=room_id, files=[resized_bytes])
         else:
             _iris_reply(room_id, err)
+    elif cmd == "/기록시작":
+        room_key = str(room_id)
+        with recording_rooms_lock:
+            if room_key in recording_rooms:
+                _iris_reply(room_id, "이미 이 방의 대화를 기록 중입니다.")
+                return
+        try:
+            supabase_request("POST", "recorded_rooms", {
+                "room_id": room_key,
+                "room_name": "",
+                "started_by": "",
+            }, prefer="return=minimal")
+            with recording_rooms_lock:
+                recording_rooms.add(room_key)
+            _iris_reply(room_id, "이 방의 대화 기록을 시작합니다.")
+        except Exception as e:
+            _iris_reply(room_id, f"기록 시작 실패: {e}")
+    elif cmd == "/기록중지":
+        room_key = str(room_id)
+        with recording_rooms_lock:
+            if room_key not in recording_rooms:
+                _iris_reply(room_id, "이 방은 기록 중이 아닙니다.")
+                return
+        try:
+            supabase_request("DELETE", f"recorded_rooms?room_id=eq.{room_key}")
+            with recording_rooms_lock:
+                recording_rooms.discard(room_key)
+            _iris_reply(room_id, "대화 기록을 중지했습니다.\n(기존 기록은 유지됩니다)")
+        except Exception as e:
+            _iris_reply(room_id, f"기록 중지 실패: {e}")
+    elif cmd == "/검색" and param:
+        _iris_reply(room_id, "검색 중...")
+        answer = search_messages(str(room_id), param)
+        _iris_reply(room_id, answer)
     elif cmd == "/help":
-        _iris_reply(room_id, "사용 가능한 명령어:\n/ping - 봇 응답 확인\n/echo <메시지> - 메시지 반복\n/time - 현재 시간\n/질문 <내용> - Gemini AI에게 질문 (대화 기억됨)\n/초기화 - AI 대화 기록 초기화\n/그림 <설명> - AI 이미지 생성\n/help - 이 도움말")
+        _iris_reply(room_id, "사용 가능한 명령어:\n/ping - 봇 응답 확인\n/echo <메시지> - 메시지 반복\n/time - 현재 시간\n/질문 <내용> - Gemini AI에게 질문 (대화 기억됨)\n/초기화 - AI 대화 기록 초기화\n/그림 <설명> - AI 이미지 생성\n/기록시작 - 대화 기록 시작\n/기록중지 - 대화 기록 중지\n/검색 <질문> - 기록된 대화에서 RAG 검색\n/help - 이 도움말")
 
 
 if __name__ == "__main__":
     print("봇 시작: 127.0.0.1:3000")
+    load_recording_rooms()
     # DB 폴링 스레드 시작 (Iris WebSocket 누락 메시지 보완)
     poll_thread = threading.Thread(target=_db_poll_loop, daemon=True)
     poll_thread.start()
